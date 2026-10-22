@@ -150,19 +150,19 @@ else
 	$(CONTAINER_CLI) compose $(COMPOSE_ENV_ARGS) $(COMPOSE_FILES) up -d --build rag-api
 endif
 
-gen-mounts:
+gen-mounts: ## Generate compose bind mounts from project bundles
 	uv run scripts/gen_compose_mounts.py
 
 enable-meili-embedding-feature:
 	uv run scripts/enable_meili_embedding.py
 
-ingest:
+ingest: ## Reingest one PROJECT bundle
 	uv run scripts/reingest_full.py "$(PROJECT)"
 
-ingest-cancel:
+ingest-cancel: ## Cancel ingest for one PROJECT
 	uv run scripts/cancel_ingest.py "$(PROJECT)"
 
-ingest-drop:
+ingest-drop: ## Drop Meilisearch indexes for one PROJECT
 	uv run scripts/drop_indexes.py "$(PROJECT)"
 
 model-images-build:
@@ -176,8 +176,8 @@ model-images-push:
 	$(CONTAINER_CLI) push $(DOCKER_PUSH_DOMAIN)/xynova/bge-base-model:latest
 	$(CONTAINER_CLI) push $(DOCKER_PUSH_DOMAIN)/xynova/gemma4-12b-model:latest
 
-diagnose:
+diagnose: ## Print compose diagnostics
 	uv run scripts/diagnose.py
 
-smoketest:
+smoketest: ## Run the compose smoketest
 	uv run scripts/smoketest.py

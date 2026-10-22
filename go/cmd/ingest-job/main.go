@@ -7,8 +7,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/xynova/lappy-rag/internal/cli/guide"
 	"github.com/xynova/lappy-rag/internal/cli/ingestjob"
-	"github.com/xynova/lappy-rag/internal/cli/shared"
 )
 
 var version = "dev"
@@ -20,7 +20,7 @@ func main() {
 		Short:        purpose,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return shared.PrintAgentGuide(cmd.OutOrStdout(), "ingest-job", version, purpose)
+			return guide.PrintAgentGuide(cmd.OutOrStdout(), "ingest-job", version, purpose)
 		},
 	}
 
@@ -47,7 +47,9 @@ func main() {
 	runCmd.Flags().String("project", "", "project id")
 	runCmd.Flags().String("mode", "incremental", "mode: full|incremental|watch")
 	runCmd.Flags().String("projects", ingestjob.DetectProjectsPath(), "comma-separated list of project bundle directories")
-	_ = runCmd.MarkFlagRequired("project")
+	if err := runCmd.MarkFlagRequired("project"); err != nil {
+		panic(err)
+	}
 	root.AddCommand(runCmd)
 
 	if err := root.Execute(); err != nil {

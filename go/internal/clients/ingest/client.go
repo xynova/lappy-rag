@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/xynova/lappy-rag/internal/clients/httpfailsafe"
+	derrors "github.com/xynova/lappy-rag/internal/errors"
 )
 
 // JobResponse mirrors the ingest-api Job JSON shape.
@@ -123,7 +124,7 @@ func (c *Client) Search(ctx context.Context, query string, topK int) ([]map[stri
 	}
 
 	if err := c.postJSON(ctx, "/query/search", payload, &resp); err != nil {
-		return nil, fmt.Errorf("ingest search: %w", err)
+		return nil, derrors.Wrap(err, derrors.CodeUnavailable, "ingest", "ingest search")
 	}
 
 	return resp.Hits, nil
@@ -141,17 +142,17 @@ func (c *Client) Plan(ctx context.Context, question string, topK int, sessionID 
 	}
 
 	if err := c.postJSON(ctx, "/query/plan", payload, &resp); err != nil {
-		return PlanResponse{}, fmt.Errorf("ingest plan: %w", err)
+		return PlanResponse{}, derrors.Wrap(err, derrors.CodeUnavailable, "ingest", "ingest plan")
 	}
 
 	if strings.TrimSpace(resp.Question) == "" {
 		resp.Question = strings.TrimSpace(question)
 	}
 	if strings.TrimSpace(resp.PlanID) == "" {
-		return PlanResponse{}, fmt.Errorf("ingest plan: empty plan_id in response")
+		return PlanResponse{}, derrors.New(derrors.CodeUnavailable, "ingest", "ingest plan: empty plan_id in response")
 	}
 	if len(resp.QueryPlan) == 0 {
-		return PlanResponse{}, fmt.Errorf("ingest plan: empty query plan in response")
+		return PlanResponse{}, derrors.New(derrors.CodeUnavailable, "ingest", "ingest plan: empty query plan in response")
 	}
 
 	return resp, nil
@@ -188,12 +189,12 @@ func (c *Client) AskDetailedWithPlan(ctx context.Context, question string, topK 
 	}
 
 	if err := c.postJSON(ctx, "/query/ask", payload, &resp); err != nil {
-		return AskResponse{}, fmt.Errorf("ingest ask: %w", err)
+		return AskResponse{}, derrors.Wrap(err, derrors.CodeUnavailable, "ingest", "ingest ask")
 	}
 
 	answer := strings.TrimSpace(resp.Answer)
 	if answer == "" {
-		return AskResponse{}, fmt.Errorf("ingest ask: empty answer in response")
+		return AskResponse{}, derrors.New(derrors.CodeUnavailable, "ingest", "ingest ask: empty answer in response")
 	}
 	resp.Answer = answer
 
@@ -209,11 +210,11 @@ func (c *Client) Enqueue(ctx context.Context, projectID, mode string) (JobRespon
 	}
 
 	if err := c.postJSON(ctx, "/jobs/ingest", payload, &job); err != nil {
-		return JobResponse{}, fmt.Errorf("enqueue ingest job: %w", err)
+		return JobResponse{}, derrors.Wrap(err, derrors.CodeUnavailable, "ingest", "enqueue ingest job")
 	}
 
 	if strings.TrimSpace(job.ID) == "" {
-		return JobResponse{}, fmt.Errorf("enqueue ingest job: missing job id in response")
+		return JobResponse{}, derrors.New(derrors.CodeUnavailable, "ingest", "enqueue ingest job: missing job id in response")
 	}
 
 	return job, nil
@@ -224,7 +225,7 @@ func (c *Client) GetJob(ctx context.Context, jobID string) (JobResponse, error) 
 	endpoint := fmt.Sprintf("%s/jobs/%s", c.host, jobID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return JobResponse{}, fmt.Errorf("create get-job request: %w", err)
+		return JobResponse{}, derrors.Wrap(err, derrors.CodeUnavailable, "ingest", "create get-job request")
 	}
 
 	resp, err := httpfailsafe.Do(ctx, c.httpClient, req, "ingest-api")
@@ -235,16 +236,16 @@ func (c *Client) GetJob(ctx context.Context, jobID string) (JobResponse, error) 
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return JobResponse{}, fmt.Errorf("read get-job response: %w", err)
+		return JobResponse{}, derrors.Wrap(err, derrors.CodeUnavailable, "ingest", "read get-job response")
 	}
 
 	if resp.StatusCode >= 400 {
-		return JobResponse{}, fmt.Errorf("get-job request failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return JobResponse{}, derrors.New(derrors.CodeUnavailable, "ingest", fmt.Sprintf("get-job request failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
 	}
 
 	var job JobResponse
 	if err := json.Unmarshal(body, &job); err != nil {
-		return JobResponse{}, fmt.Errorf("parse get-job response: %w", err)
+		return JobResponse{}, derrors.Wrap(err, derrors.CodeUnavailable, "ingest", "parse get-job response")
 	}
 
 	return job, nil
@@ -266,7 +267,7 @@ func (c *Client) PollJob(ctx context.Context, jobID string, pollInterval time.Du
 
 		select {
 		case <-ctx.Done():
-			return JobResponse{}, fmt.Errorf("poll ingest job timed out: %w", ctx.Err())
+			return JobResponse{}, derrors.Wrap(ctx.Err(), derrors.CodeDeadline, "ingest.PollJob", "poll ingest job timed out")
 		case <-time.After(pollInterval):
 		}
 	}
@@ -275,12 +276,12 @@ func (c *Client) PollJob(ctx context.Context, jobID string, pollInterval time.Du
 func (c *Client) postJSON(ctx context.Context, path string, payload, out any) error {
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("marshal request payload: %w", err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "ingest", "marshal request payload")
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.host+path, bytes.NewReader(raw))
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "ingest", "create request")
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -293,11 +294,11 @@ func (c *Client) postJSON(ctx context.Context, path string, payload, out any) er
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("read response: %w", err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "ingest", "read response")
 	}
 
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("request failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return derrors.New(derrors.CodeUnavailable, "ingest", fmt.Sprintf("request failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
 	}
 
 	if len(body) == 0 {
@@ -305,7 +306,7 @@ func (c *Client) postJSON(ctx context.Context, path string, payload, out any) er
 	}
 
 	if err := json.Unmarshal(body, out); err != nil {
-		return fmt.Errorf("parse response: %w", err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "ingest", "parse response")
 	}
 
 	return nil

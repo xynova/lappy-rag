@@ -3,22 +3,23 @@ package ingestapi
 import (
 	"context"
 	"errors"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/xynova/lappy-rag/internal/observability"
 )
 
-func listenAndServe(ctx context.Context, httpServer *http.Server, onShutdown func()) error {
+func listenAndServe(ctx context.Context, httpServer *http.Server, logger *observability.Logger, onShutdown func()) error {
 	if httpServer == nil {
 		return errors.New("http server is required")
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("ingest-api listening on %s", httpServer.Addr)
+		logger.Infof("ingest-api listening on %s", httpServer.Addr)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}

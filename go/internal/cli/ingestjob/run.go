@@ -4,12 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/xynova/lappy-rag/internal/cli/shared"
+	"github.com/xynova/lappy-rag/internal/cli/guide"
 	"github.com/xynova/lappy-rag/internal/clients/meili"
 	derrors "github.com/xynova/lappy-rag/internal/errors"
 	"github.com/xynova/lappy-rag/internal/jobs"
@@ -54,7 +53,7 @@ func (c RunConfig) Run(ctx context.Context) error {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if err := observability.ShutdownOTEL(shutdownCtx, provider); err != nil {
-				log.Printf("warning: failed to shutdown openinference tracer provider: %v", err)
+				observability.NewLogger("ingest-job").Warnf("failed to shutdown openinference tracer provider: %v", err)
 			}
 		}()
 	}
@@ -81,11 +80,11 @@ func (c RunConfig) Run(ctx context.Context) error {
 	jobCtx, cancel := context.WithTimeout(ctx, 6*time.Hour)
 	defer cancel()
 
-	traceCtx, rootSpan := shared.StartCommandTrace(jobCtx, traceCfg, "ingest_job.run")
+	traceCtx, rootSpan := guide.StartCommandTrace(jobCtx, traceCfg, "ingest_job.run")
 	var runErr error
 	defer observability.EndSpanWithStatus(rootSpan, &runErr)
 
-	stats, err := jobs.RunOnceWithDeps(traceCtx, project, jobs.Mode(mode), allowSymlinks, searchClient, stateStore, clock)
+	stats, err := jobs.RunOnceWithDeps(traceCtx, project, jobs.Mode(mode), allowSymlinks, searchClient, searchClient, stateStore, clock)
 	if err != nil {
 		runErr = err
 		return derrors.Wrap(err, derrors.CodeUnavailable, "ingestjob.Run", fmt.Sprintf("run ingest for project %q in mode %q", projectID, mode))

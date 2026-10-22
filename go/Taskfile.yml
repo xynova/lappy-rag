@@ -33,26 +33,36 @@ tasks:
 
   vet:
     desc: Run go vet
+    summary: |
+      Runs go vet on all packages in this module.
     cmds:
       - go vet ./...
 
   test:
     desc: Run unit tests
+    summary: |
+      Runs go test on all packages in this module.
     cmds:
       - go test ./...
 
   build:
     desc: Compile all commands
+    summary: |
+      Runs go build on ./cmd/...
     cmds:
       - go build ./cmd/...
 
   tidy:
     desc: go mod tidy
+    summary: |
+      Runs go mod tidy in this module.
     cmds:
       - go mod tidy
 
   hooks-install:
     desc: Install Lefthook git hooks
+    summary: |
+      Runs lefthook install from the product git root (parent of go/).
     dir: ..
     cmds:
       - lefthook install

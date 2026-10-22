@@ -20,7 +20,8 @@ linters:
   settings:
     # Former gocyclo min-complexity 15 until complexity debt is paid down.
     gocognit:
-      # Raised until ingestapi complexity debt is paid (former gocyclo 15 baseline).
+      # 2026-10-22: keep 35 until ingestapi/server.go and jobs/manager.go are split
+      # (review-go-module). Former gocyclo 15 baseline.
       min-complexity: 35
     errcheck:
       check-defer: false
@@ -34,7 +35,7 @@ linters:
       confidence: medium
     goconst:
       min-len: 4
-      min-occurrences: 14
+      min-occurrences: 5
       ignore-tests: true
     staticcheck:
       checks:

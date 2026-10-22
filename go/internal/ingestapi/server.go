@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,9 +17,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xynova/lappy-rag/internal/clients/httpfailsafe"
 	"github.com/xynova/lappy-rag/internal/clients/localai"
 	"github.com/xynova/lappy-rag/internal/clients/meili"
 	"github.com/xynova/lappy-rag/internal/dspygo"
+	derrors "github.com/xynova/lappy-rag/internal/errors"
 	"github.com/xynova/lappy-rag/internal/ingestapi/sessionstore"
 	"github.com/xynova/lappy-rag/internal/jobs"
 	"github.com/xynova/lappy-rag/internal/observability"
@@ -30,6 +31,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 )
+
+var encodeLogger = observability.NewLogger("ingest-api")
 
 type ingestRequest struct {
 	ProjectID  string `json:"project_id"`
@@ -56,6 +59,8 @@ type Server struct {
 	localAIClient    *localai.Client
 	sessionStore     *sessionstore.Store
 	clock            func() time.Time
+	logger           *observability.Logger
+	httpClient       *http.Client
 	planMu           sync.RWMutex
 	plannedQueries   map[string]plannedQuery
 	sessionPlans     map[string][]plannedQuery
@@ -187,22 +192,23 @@ func Serve(ctx context.Context) error {
 	chatPath := detectChatSettingsPath()
 	defaults, personas, models, traceCfg, err := loadChatSettings(chatPath)
 	if err != nil {
-		return fmt.Errorf("load chat settings: %w", err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "ingestapi.Serve", "load chat settings")
 	}
 	traceServiceName := observability.ServiceNameFromConfig(&traceCfg)
+	logger := observability.NewLogger("ingest-api")
 
 	var otelProvider *trace.TracerProvider
 	if traceCfg.Enabled {
 		provider, err := observability.InitOTEL(traceServiceName, traceCfg.Endpoint)
 		if err != nil {
-			return fmt.Errorf("initialize openinference tracer provider: %w", err)
+			return derrors.Wrap(err, derrors.CodeUnavailable, "ingestapi.Serve", "initialize openinference tracer provider")
 		}
 		otelProvider = provider
 	}
 
 	projectsCfg, err := registry.LoadMany(registryPath)
 	if err != nil {
-		return fmt.Errorf("load projects config: %w", err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "ingestapi.Serve", "load projects config")
 	}
 
 	maxGlobal := getenvInt("MAX_CONCURRENT_JOBS", 3)
@@ -210,7 +216,7 @@ func Serve(ctx context.Context) error {
 
 	searchClient, err := meili.New()
 	if err != nil {
-		return fmt.Errorf("initialize meilisearch client: %w", err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "ingestapi.Serve", "initialize meilisearch client")
 	}
 
 	allowSymlinks := strings.EqualFold(strings.TrimSpace(os.Getenv("ALLOW_FOLLOW_SYMLINKS")), "true")
@@ -218,24 +224,30 @@ func Serve(ctx context.Context) error {
 	stateStore := jobs.NewFileStateStore(stateDir)
 	clock := jobs.NewRealClock()
 
-	manager := jobs.NewManager(maxGlobal, maxPerProject, allowSymlinks, projectsCfg, searchClient, stateStore, clock)
+	manager := jobs.ManagerConfig{
+		MaxGlobal:     maxGlobal,
+		MaxPerProject: maxPerProject,
+		AllowSymlinks: allowSymlinks,
+		Projects:      projectsCfg,
+		IndexAdmin:    searchClient,
+		Documents:     searchClient,
+		State:         stateStore,
+		Clock:         clock,
+	}.CreateManager()
 
 	inferenceTimeout := time.Duration(getenvInt("INFERENCE_TIMEOUT_SECONDS", 240)) * time.Second
 
 	localAIClient, err := localai.New()
 	if err != nil {
-		return fmt.Errorf("initialize localai client: %w", err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "ingestapi.Serve", "initialize localai client")
 	}
 
-	var sessionStore *sessionstore.Store
-	sess, err := sessionstore.Open(sessionstore.Config{
+	sessionStore, err := sessionstore.Open(sessionstore.Config{
 		DBPath: filepath.Join(stateDir, "query-plans.db"),
 		Now:    clock.Now,
 	})
 	if err != nil {
-		log.Printf("warning: failed to initialize durable query session store, continuing with in-memory cache only: %v", err)
-	} else {
-		sessionStore = sess
+		return derrors.Wrap(err, derrors.CodeUnavailable, "ingestapi.Serve", "initialize durable query session store")
 	}
 
 	server := &Server{
@@ -252,6 +264,8 @@ func Serve(ctx context.Context) error {
 		localAIClient:    localAIClient,
 		sessionStore:     sessionStore,
 		clock:            clock.Now,
+		logger:           logger,
+		httpClient:       &http.Client{},
 		plannedQueries:   make(map[string]plannedQuery),
 		sessionPlans:     make(map[string][]plannedQuery),
 		planTTL:          time.Duration(getenvInt("QUERY_PLAN_TTL_SECONDS", 600)) * time.Second,
@@ -279,14 +293,16 @@ func Serve(ctx context.Context) error {
 		IdleTimeout:       inferenceTimeout + 60*time.Second,
 	}
 
-	return listenAndServe(ctx, httpServer, func() {
+	return listenAndServe(ctx, httpServer, logger, func() {
 		if sessionStore != nil {
 			_ = sessionStore.Close()
 		}
 		if otelProvider != nil {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			_ = observability.ShutdownOTEL(shutdownCtx, otelProvider)
+			if err := observability.ShutdownOTEL(shutdownCtx, otelProvider); err != nil {
+				logger.Warnf("failed to shutdown openinference tracer provider: %v", err)
+			}
 		}
 	})
 }
@@ -305,9 +321,15 @@ func detectProjectsPath() string {
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(map[string]string{"status": "ok"}); err != nil {
-		log.Printf("failed to write health response: %v", err)
+		s.logger.Warnf("failed to write health response: %v", err)
 	}
 }
+
+const (
+	diagStatusError   = "error"
+	diagNameInference = "localai_inference"
+	diagNameMCP       = "mcp_server"
+)
 
 // diagCheck is the result of a single diagnostic probe.
 type diagCheck struct {
@@ -365,10 +387,10 @@ func (s *Server) diagMeilisearch(ctx context.Context) diagCheck {
 	start := time.Now()
 	lat := func() int64 { return time.Since(start).Milliseconds() }
 	if s.meiliClient == nil {
-		return diagCheck{Name: "meilisearch", Status: "error", Message: "client not configured", LatencyMs: lat()}
+		return diagCheck{Name: "meilisearch", Status: diagStatusError, Message: "client not configured", LatencyMs: lat()}
 	}
 	if err := s.meiliClient.Health(ctx); err != nil {
-		return diagCheck{Name: "meilisearch", Status: "error", Message: err.Error(), LatencyMs: lat()}
+		return diagCheck{Name: "meilisearch", Status: diagStatusError, Message: err.Error(), LatencyMs: lat()}
 	}
 	return diagCheck{Name: "meilisearch", Status: "ok", Message: "available.", LatencyMs: lat()}
 }
@@ -377,11 +399,11 @@ func (s *Server) diagMeilisearchIndexes(ctx context.Context) diagCheck {
 	start := time.Now()
 	lat := time.Since(start).Milliseconds()
 	if s.meiliClient == nil {
-		return diagCheck{Name: "meilisearch_indexes", Status: "error", Message: "client not configured", LatencyMs: lat}
+		return diagCheck{Name: "meilisearch_indexes", Status: diagStatusError, Message: "client not configured", LatencyMs: lat}
 	}
 	uids, err := s.meiliClient.ListIndexUIDs(ctx, 100)
 	if err != nil {
-		return diagCheck{Name: "meilisearch_indexes", Status: "error", Message: err.Error(), LatencyMs: lat}
+		return diagCheck{Name: "meilisearch_indexes", Status: diagStatusError, Message: err.Error(), LatencyMs: lat}
 	}
 	existing := map[string]struct{}{}
 	for _, uid := range uids {
@@ -407,14 +429,14 @@ func (s *Server) diagEmbed(ctx context.Context) diagCheck {
 	embedURL := strings.TrimRight(strings.TrimSpace(os.Getenv("EMBED_URL")), "/")
 	embedModel := strings.TrimSpace(os.Getenv("EMBED_MODEL"))
 	if embedURL == "" {
-		return diagCheck{Name: "localai_embed", Status: "error", Message: "EMBED_URL not set.", LatencyMs: 0}
+		return diagCheck{Name: "localai_embed", Status: diagStatusError, Message: "EMBED_URL not set.", LatencyMs: 0}
 	}
 	if embedModel == "" {
 		embedModel = "bge-base-en-v1.5"
 	}
 	start := time.Now()
 	if err := s.localAIClient.PingEmbed(ctx, embedURL, embedModel); err != nil {
-		return diagCheck{Name: "localai_embed", Status: "error", Message: err.Error(), LatencyMs: time.Since(start).Milliseconds()}
+		return diagCheck{Name: "localai_embed", Status: diagStatusError, Message: err.Error(), LatencyMs: time.Since(start).Milliseconds()}
 	}
 	return diagCheck{Name: "localai_embed", Status: "ok", Message: "embeddings endpoint reachable.", LatencyMs: time.Since(start).Milliseconds()}
 }
@@ -422,7 +444,7 @@ func (s *Server) diagEmbed(ctx context.Context) diagCheck {
 func (s *Server) diagInference(ctx context.Context) diagCheck {
 	baseURL, apiKey, model, err := resolveInferenceEnv()
 	if err != nil {
-		return diagCheck{Name: "localai_inference", Status: "error", Message: err.Error(), LatencyMs: 0}
+		return diagCheck{Name: diagNameInference, Status: diagStatusError, Message: err.Error(), LatencyMs: 0}
 	}
 	_, maxTokens := resolveInferenceOptions(nil, nil, model, s.chatModels)
 	payloadMap := map[string]any{
@@ -437,7 +459,7 @@ func (s *Server) diagInference(ctx context.Context) diagCheck {
 	status, body, err := infClient.ChatCompletions(ctx, payloadMap)
 	lat := time.Since(start).Milliseconds()
 	if err != nil {
-		return diagCheck{Name: "localai_inference", Status: "error", Message: err.Error(), LatencyMs: lat}
+		return diagCheck{Name: diagNameInference, Status: diagStatusError, Message: err.Error(), LatencyMs: lat}
 	}
 	var result struct {
 		Choices []struct {
@@ -448,37 +470,47 @@ func (s *Server) diagInference(ctx context.Context) diagCheck {
 		} `json:"choices"`
 	}
 	if status >= 400 || json.Unmarshal(body, &result) != nil || len(result.Choices) == 0 {
-		return diagCheck{Name: "localai_inference", Status: "error", Message: fmt.Sprintf("invalid inference response (status %d).", status), LatencyMs: lat}
+		return diagCheck{Name: diagNameInference, Status: diagStatusError, Message: fmt.Sprintf("invalid inference response (status %d).", status), LatencyMs: lat}
 	}
 	content := strings.TrimSpace(result.Choices[0].Message.Content)
 	reasoning := strings.TrimSpace(result.Choices[0].Message.Reasoning)
 	if content == "" {
 		if reasoning != "" {
-			return diagCheck{Name: "localai_inference", Status: "info", Message: "reasoning-only response received.", LatencyMs: lat}
+			return diagCheck{Name: diagNameInference, Status: "info", Message: "reasoning-only response received.", LatencyMs: lat}
 		}
-		return diagCheck{Name: "localai_inference", Status: "error", Message: "empty content in response.", LatencyMs: lat}
+		return diagCheck{Name: diagNameInference, Status: diagStatusError, Message: "empty content in response.", LatencyMs: lat}
 	}
-	return diagCheck{Name: "localai_inference", Status: "ok", Message: fmt.Sprintf("model responded: %q", content), LatencyMs: lat}
+	return diagCheck{Name: diagNameInference, Status: "ok", Message: fmt.Sprintf("model responded: %q", content), LatencyMs: lat}
 }
 
 func (s *Server) diagMCPServer(ctx context.Context) diagCheck {
+	if ctx == nil {
+		return diagCheck{Name: diagNameMCP, Status: diagStatusError, Message: "context is required", LatencyMs: 0}
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		return diagCheck{Name: diagNameMCP, Status: diagStatusError, Message: "context deadline is required", LatencyMs: 0}
+	}
 	mcpPort := getenvInt("MCP_PORT", 3000)
 	url := fmt.Sprintf("http://localhost:%d/health", mcpPort)
 	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return diagCheck{Name: "mcp_server", Status: "error", Message: fmt.Sprintf("build request: %v", err), LatencyMs: 0}
+		return diagCheck{Name: diagNameMCP, Status: diagStatusError, Message: fmt.Sprintf("build request: %v", err), LatencyMs: 0}
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := s.httpClient
+	if client == nil {
+		client = &http.Client{}
+	}
+	resp, err := httpfailsafe.Do(ctx, client, req, "mcp")
 	lat := time.Since(start).Milliseconds()
 	if err != nil {
-		return diagCheck{Name: "mcp_server", Status: "error", Message: err.Error(), LatencyMs: lat}
+		return diagCheck{Name: diagNameMCP, Status: diagStatusError, Message: err.Error(), LatencyMs: lat}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return diagCheck{Name: "mcp_server", Status: "error", Message: fmt.Sprintf("unexpected status %d.", resp.StatusCode), LatencyMs: lat}
+		return diagCheck{Name: diagNameMCP, Status: diagStatusError, Message: fmt.Sprintf("unexpected status %d.", resp.StatusCode), LatencyMs: lat}
 	}
-	return diagCheck{Name: "mcp_server", Status: "ok", Message: "healthy.", LatencyMs: lat}
+	return diagCheck{Name: diagNameMCP, Status: "ok", Message: "healthy.", LatencyMs: lat}
 }
 
 func (s *Server) handleProjects(w http.ResponseWriter, _ *http.Request) {
@@ -669,13 +701,15 @@ func (s *Server) handleDropIndexes(w http.ResponseWriter, r *http.Request) {
 			}
 			// Cancel any stuck embed tasks, then wait briefly for the cancellation to take
 			// effect before issuing the delete so it is not queued behind them.
-			_ = s.meiliClient.CancelIndexTasks(ctx, p.IndexName)
+			if err := s.meiliClient.CancelIndexTasks(ctx, p.IndexName); err != nil {
+				s.logger.Warnf("ingest-drop: cancel tasks for index %q: %v", p.IndexName, err)
+			}
 			time.Sleep(2 * time.Second)
 			if err := s.meiliClient.DeleteAllDocuments(ctx, p.IndexName); err != nil {
-				log.Printf("ingest-drop: failed to delete documents for index %q: %v", p.IndexName, err)
+				s.logger.Warnf("ingest-drop: failed to delete documents for index %q: %v", p.IndexName, err)
 				continue
 			}
-			log.Printf("ingest-drop: dropped index %q", p.IndexName)
+			s.logger.Infof("ingest-drop: dropped index %q", p.IndexName)
 		}
 	}()
 }
@@ -789,7 +823,12 @@ func (s *Server) handleQueryPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reuseSource := "none"
-	if prior, source, ok := s.findSimilarSessionPlan(sessionID, question); ok {
+	prior, source, ok, err := s.findSimilarSessionPlan(sessionID, question)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if ok {
 		plan.Queries = mergePlanQueries(plan.Queries, prior.QueryPlan)
 		reuseSource = source
 	}
@@ -959,7 +998,7 @@ func (s *Server) handleQueryAsk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, inferErr.Error(), http.StatusBadGateway)
 		return
 	}
-	s.recordSuccessfulSessionPlan(sessionID, plannedQuery{
+	if err := s.recordSuccessfulSessionPlan(sessionID, plannedQuery{
 		SessionID:        sessionID,
 		Question:         question,
 		RoutedIndexes:    append([]string(nil), routedIndexes...),
@@ -968,7 +1007,10 @@ func (s *Server) handleQueryAsk(w http.ResponseWriter, r *http.Request) {
 		TopK:             topK,
 		SemanticRatio:    semanticRatio,
 		CreatedAt:        s.nowTime(),
-	})
+	}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	writeJSON(w, http.StatusOK, queryAskResponse{
 		Question:      question,
@@ -1117,12 +1159,13 @@ func tokenizeQuestion(value string) []string {
 	return out
 }
 
-func (s *Server) findSimilarSessionPlan(sessionID, question string) (plannedQuery, string, bool) {
+func (s *Server) findSimilarSessionPlan(sessionID, question string) (plannedQuery, string, bool, error) {
 	if s.sessionStore != nil {
 		stored, ok, err := s.sessionStore.FindSimilar(sessionID, question, semanticallyMatchesQuestion)
 		if err != nil {
-			log.Printf("query-session-store: similar lookup failed: %v", err)
-		} else if ok {
+			return plannedQuery{}, "none", false, derrors.Wrap(err, derrors.CodeUnavailable, "ingestapi.findSimilarSessionPlan", "similar lookup")
+		}
+		if ok {
 			return plannedQuery{
 				SessionID:     stored.SessionID,
 				Question:      stored.Question,
@@ -1131,12 +1174,12 @@ func (s *Server) findSimilarSessionPlan(sessionID, question string) (plannedQuer
 				TopK:          stored.TopK,
 				SemanticRatio: stored.SemanticRatio,
 				CreatedAt:     stored.CreatedAt,
-			}, "sqlite", true
+			}, "sqlite", true, nil
 		}
 	}
 
 	if strings.TrimSpace(sessionID) == "" {
-		return plannedQuery{}, "none", false
+		return plannedQuery{}, "none", false, nil
 	}
 	s.planMu.Lock()
 	defer s.planMu.Unlock()
@@ -1147,15 +1190,15 @@ func (s *Server) findSimilarSessionPlan(sessionID, question string) (plannedQuer
 	for i := len(plans) - 1; i >= 0; i-- {
 		candidate := plans[i]
 		if semanticallyMatchesQuestion(question, candidate.Question) {
-			return candidate, "memory", true
+			return candidate, "memory", true, nil
 		}
 	}
-	return plannedQuery{}, "none", false
+	return plannedQuery{}, "none", false, nil
 }
 
-func (s *Server) recordSuccessfulSessionPlan(sessionID string, plan plannedQuery) {
+func (s *Server) recordSuccessfulSessionPlan(sessionID string, plan plannedQuery) error {
 	if strings.TrimSpace(sessionID) == "" {
-		return
+		return nil
 	}
 
 	if s.sessionStore != nil {
@@ -1168,7 +1211,7 @@ func (s *Server) recordSuccessfulSessionPlan(sessionID string, plan plannedQuery
 			SemanticRatio: plan.SemanticRatio,
 			CreatedAt:     plan.CreatedAt,
 		}); err != nil {
-			log.Printf("query-session-store: failed to persist successful plan: %v", err)
+			return derrors.Wrap(err, derrors.CodeUnavailable, "ingestapi.recordSuccessfulSessionPlan", "persist successful plan")
 		}
 	}
 
@@ -1182,6 +1225,7 @@ func (s *Server) recordSuccessfulSessionPlan(sessionID string, plan plannedQuery
 		plans = plans[len(plans)-10:]
 	}
 	s.sessionPlans[sessionID] = plans
+	return nil
 }
 
 func (s *Server) storePlannedQuery(plan plannedQuery) string {
@@ -1372,7 +1416,7 @@ func (s *Server) resolveChatConfig(routedIndexes []string) queryChatConfig {
 		if persona != "" {
 			profile, ok := s.chatPersonas[persona]
 			if !ok {
-				log.Printf("chat persona %q not found for project %q", persona, project.ID)
+				s.logger.Warnf("chat persona %q not found for project %q", persona, project.ID)
 			} else {
 				personaStyle = strings.TrimSpace(profile.Style)
 				if strings.TrimSpace(profile.Model) != "" {
@@ -1758,7 +1802,7 @@ func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		log.Printf("failed to encode JSON response: %v", err)
+		encodeLogger.Warnf("failed to encode JSON response: %v", err)
 	}
 }
 

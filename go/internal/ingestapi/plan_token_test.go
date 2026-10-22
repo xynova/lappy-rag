@@ -123,15 +123,17 @@ func newTestServerForPlanAskHTTP(t *testing.T) *Server {
 		},
 	}}}
 
-	manager := jobs.NewManager(
-		1,
-		1,
-		false,
-		projectsCfg,
-		&fakeJobsSearchClient{},
-		jobs.NewFileStateStore(t.TempDir()),
-		jobs.NewRealClock(),
-	)
+	fakeSearch := &fakeJobsSearchClient{}
+	manager := jobs.ManagerConfig{
+		MaxGlobal:     1,
+		MaxPerProject: 1,
+		AllowSymlinks: false,
+		Projects:      projectsCfg,
+		IndexAdmin:    fakeSearch,
+		Documents:     fakeSearch,
+		State:         jobs.NewFileStateStore(t.TempDir()),
+		Clock:         jobs.NewRealClock(),
+	}.CreateManager()
 
 	frozen := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	return &Server{

@@ -38,6 +38,9 @@ docker/certs/*.crt
 docker/certs/*.pem
 docker/certs/*.cer
 
+# ── Local review dumps ───────────────────────────────────────────────────────
+tmp/
+
 # ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc

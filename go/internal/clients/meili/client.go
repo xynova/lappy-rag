@@ -144,11 +144,11 @@ func (c *Client) EnsureIndex(ctx context.Context, indexName string) error {
 		if status == http.StatusConflict || status == http.StatusBadRequest {
 			return nil
 		}
-		return fmt.Errorf("ensure meilisearch index %q: %w", indexName, err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "meili.EnsureIndex", fmt.Sprintf("ensure meilisearch index %q", indexName))
 	}
 
 	if status != http.StatusAccepted && status != http.StatusCreated {
-		return fmt.Errorf("ensure meilisearch index %q: unexpected status %d", indexName, status)
+		return derrors.New(derrors.CodeUnavailable, "meili.EnsureIndex", fmt.Sprintf("ensure meilisearch index %q: unexpected status %d", indexName, status))
 	}
 
 	return nil
@@ -178,11 +178,11 @@ func (c *Client) ApplySettings(ctx context.Context, indexName string) error {
 
 	status, task, err := c.request(ctx, http.MethodPatch, fmt.Sprintf("/indexes/%s/settings", indexName), settings)
 	if err != nil {
-		return fmt.Errorf("apply index settings for %q: %w", indexName, err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "meili.ApplySettings", fmt.Sprintf("apply index settings for %q", indexName))
 	}
 
 	if status != http.StatusAccepted {
-		return fmt.Errorf("apply index settings for %q: unexpected status %d", indexName, status)
+		return derrors.New(derrors.CodeUnavailable, "meili.ApplySettings", fmt.Sprintf("apply index settings for %q: unexpected status %d", indexName, status))
 	}
 
 	return c.waitTask(ctx, task.TaskUID)
@@ -199,11 +199,11 @@ func (c *Client) EnableChatCompletions(ctx context.Context) error {
 
 	status, _, err := c.request(ctx, http.MethodPatch, "/experimental-features", payload)
 	if err != nil {
-		return fmt.Errorf("enable meilisearch embedding experimental feature %q: %w", featureKey, err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "meili.EnableChatCompletions", fmt.Sprintf("enable meilisearch embedding experimental feature %q", featureKey))
 	}
 
 	if status != http.StatusOK {
-		return fmt.Errorf("enable meilisearch embedding experimental feature %q: unexpected status %d", featureKey, status)
+		return derrors.New(derrors.CodeUnavailable, "meili.EnableChatCompletions", fmt.Sprintf("enable meilisearch embedding experimental feature %q: unexpected status %d", featureKey, status))
 	}
 
 	return nil
@@ -212,7 +212,7 @@ func (c *Client) EnableChatCompletions(ctx context.Context) error {
 func (c *Client) resolveEmbeddingFeatureKey(ctx context.Context) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.host+"/experimental-features", nil)
 	if err != nil {
-		return "", fmt.Errorf("create experimental features request: %w", err)
+		return "", derrors.Wrap(err, derrors.CodeUnavailable, "meili", "create experimental features request")
 	}
 
 	if c.masterKey != "" {
@@ -227,16 +227,16 @@ func (c *Client) resolveEmbeddingFeatureKey(ctx context.Context) (string, error)
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("read experimental features response: %w", err)
+		return "", derrors.Wrap(err, derrors.CodeUnavailable, "meili", "read experimental features response")
 	}
 
 	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("read experimental features: status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return "", derrors.New(derrors.CodeUnavailable, "meili", fmt.Sprintf("read experimental features: status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw))))
 	}
 
 	features := map[string]any{}
 	if err := json.Unmarshal(raw, &features); err != nil {
-		return "", fmt.Errorf("unmarshal experimental features: %w", err)
+		return "", derrors.Wrap(err, derrors.CodeUnavailable, "meili", "unmarshal experimental features")
 	}
 
 	if _, ok := features["chatCompletions"]; ok {
@@ -253,7 +253,7 @@ func (c *Client) resolveEmbeddingFeatureKey(ctx context.Context) (string, error)
 	}
 	sort.Strings(keys)
 
-	return "", fmt.Errorf("no supported meilisearch embedding feature key found (expected chatCompletions or compositeEmbedders; available: %s)", strings.Join(keys, ", "))
+	return "", derrors.New(derrors.CodeUnavailable, "meili", fmt.Sprintf("no supported meilisearch embedding feature key found (expected chatCompletions or compositeEmbedders; available: %s)", strings.Join(keys, ", ")))
 }
 
 // CancelIndexTasks cancels all enqueued and processing tasks for the given index.
@@ -263,10 +263,10 @@ func (c *Client) CancelIndexTasks(ctx context.Context, indexName string) error {
 	path := fmt.Sprintf("/tasks/cancel?indexUids=%s&statuses=enqueued,processing", indexName)
 	status, task, err := c.request(ctx, http.MethodPost, path, nil)
 	if err != nil {
-		return fmt.Errorf("cancel tasks for index %q: %w", indexName, err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "meili", fmt.Sprintf("cancel tasks for index %q", indexName))
 	}
 	if status != http.StatusOK {
-		return fmt.Errorf("cancel tasks for index %q: unexpected status %d", indexName, status)
+		return derrors.New(derrors.CodeUnavailable, "meili", fmt.Sprintf("cancel tasks for index %q: unexpected status %d", indexName, status))
 	}
 	_ = task
 	return nil
@@ -277,7 +277,7 @@ func (c *Client) CancelIndexTasks(ctx context.Context, indexName string) error {
 func (c *Client) ApplyEmbedders(ctx context.Context, indexName string) error {
 	embedURL := strings.TrimRight(strings.TrimSpace(os.Getenv("EMBED_URL")), "/")
 	if embedURL == "" {
-		return fmt.Errorf("EMBED_URL is required")
+		return derrors.New(derrors.CodeInvalid, "meili.ApplyEmbedders", "EMBED_URL is required")
 	}
 
 	embedModel := strings.TrimSpace(os.Getenv("EMBED_MODEL"))
@@ -312,11 +312,11 @@ func (c *Client) ApplyEmbedders(ctx context.Context, indexName string) error {
 
 	status, task, err := c.request(ctx, http.MethodPatch, fmt.Sprintf("/indexes/%s/settings/embedders", indexName), payload)
 	if err != nil {
-		return fmt.Errorf("apply embedders for %q: %w", indexName, err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "meili", fmt.Sprintf("apply embedders for %q", indexName))
 	}
 
 	if status != http.StatusAccepted {
-		return fmt.Errorf("apply embedders for %q: unexpected status %d", indexName, status)
+		return derrors.New(derrors.CodeUnavailable, "meili", fmt.Sprintf("apply embedders for %q: unexpected status %d", indexName, status))
 	}
 
 	return c.waitTask(ctx, task.TaskUID)
@@ -326,11 +326,11 @@ func (c *Client) ApplyEmbedders(ctx context.Context, indexName string) error {
 func (c *Client) DeleteAllDocuments(ctx context.Context, indexName string) error {
 	status, task, err := c.request(ctx, http.MethodDelete, fmt.Sprintf("/indexes/%s/documents", indexName), nil)
 	if err != nil {
-		return fmt.Errorf("delete documents for %q: %w", indexName, err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "meili", fmt.Sprintf("delete documents for %q", indexName))
 	}
 
 	if status != http.StatusAccepted {
-		return fmt.Errorf("delete documents for %q: unexpected status %d", indexName, status)
+		return derrors.New(derrors.CodeUnavailable, "meili", fmt.Sprintf("delete documents for %q: unexpected status %d", indexName, status))
 	}
 
 	return c.waitTask(ctx, task.TaskUID)
@@ -340,11 +340,11 @@ func (c *Client) DeleteAllDocuments(ctx context.Context, indexName string) error
 func (c *Client) AddDocuments(ctx context.Context, indexName string, docs []Document) (int, error) {
 	status, task, err := c.request(ctx, http.MethodPost, fmt.Sprintf("/indexes/%s/documents?primaryKey=id", indexName), docs)
 	if err != nil {
-		return 0, fmt.Errorf("add documents to %q: %w", indexName, err)
+		return 0, derrors.Wrap(err, derrors.CodeUnavailable, "meili", fmt.Sprintf("add documents to %q", indexName))
 	}
 
 	if status != http.StatusAccepted {
-		return 0, fmt.Errorf("add documents to %q: unexpected status %d", indexName, status)
+		return 0, derrors.New(derrors.CodeUnavailable, "meili", fmt.Sprintf("add documents to %q: unexpected status %d", indexName, status))
 	}
 
 	if err := c.waitTask(ctx, task.TaskUID); err != nil {
@@ -374,13 +374,13 @@ type FacetResponse struct {
 func (c *Client) Search(ctx context.Context, indexName string, payload SearchPayload) ([]SearchHit, error) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("marshal meili search payload: %w", err)
+		return nil, derrors.Wrap(err, derrors.CodeUnavailable, "meili", "marshal meili search payload")
 	}
 
 	endpoint := fmt.Sprintf("%s/indexes/%s/search", c.host, indexName)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
 	if err != nil {
-		return nil, fmt.Errorf("create meili search request for %q: %w", indexName, err)
+		return nil, derrors.Wrap(err, derrors.CodeUnavailable, "meili", fmt.Sprintf("create meili search request for %q", indexName))
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -396,16 +396,16 @@ func (c *Client) Search(ctx context.Context, indexName string, payload SearchPay
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read meili search response for %q: %w", indexName, err)
+		return nil, derrors.Wrap(err, derrors.CodeUnavailable, "meili", fmt.Sprintf("read meili search response for %q", indexName))
 	}
 
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("meili search failed for %q: status %d: %s", indexName, resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, derrors.New(derrors.CodeUnavailable, "meili", fmt.Sprintf("meili search failed for %q: status %d: %s", indexName, resp.StatusCode, strings.TrimSpace(string(body))))
 	}
 
 	var parsed SearchResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, fmt.Errorf("parse meili search response for %q: %w", indexName, err)
+		return nil, derrors.Wrap(err, derrors.CodeUnavailable, "meili", fmt.Sprintf("parse meili search response for %q", indexName))
 	}
 
 	return parsed.Hits, nil
@@ -415,13 +415,13 @@ func (c *Client) Search(ctx context.Context, indexName string, payload SearchPay
 func (c *Client) SearchFacets(ctx context.Context, indexName string, payload SearchPayload) (map[string]map[string]int, error) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return nil, fmt.Errorf("marshal meili facet payload: %w", err)
+		return nil, derrors.Wrap(err, derrors.CodeUnavailable, "meili", "marshal meili facet payload")
 	}
 
 	endpoint := fmt.Sprintf("%s/indexes/%s/search", c.host, indexName)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(raw))
 	if err != nil {
-		return nil, fmt.Errorf("create meili facet request for %q: %w", indexName, err)
+		return nil, derrors.Wrap(err, derrors.CodeUnavailable, "meili", fmt.Sprintf("create meili facet request for %q", indexName))
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -437,16 +437,16 @@ func (c *Client) SearchFacets(ctx context.Context, indexName string, payload Sea
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read meili facet response for %q: %w", indexName, err)
+		return nil, derrors.Wrap(err, derrors.CodeUnavailable, "meili", fmt.Sprintf("read meili facet response for %q", indexName))
 	}
 
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("meili facet query failed for %q: status %d: %s", indexName, resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, derrors.New(derrors.CodeUnavailable, "meili", fmt.Sprintf("meili facet query failed for %q: status %d: %s", indexName, resp.StatusCode, strings.TrimSpace(string(body))))
 	}
 
 	var parsed FacetResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return nil, fmt.Errorf("parse meili facet response for %q: %w", indexName, err)
+		return nil, derrors.Wrap(err, derrors.CodeUnavailable, "meili", fmt.Sprintf("parse meili facet response for %q", indexName))
 	}
 
 	return parsed.FacetDistribution, nil
@@ -466,11 +466,11 @@ func (c *Client) DeleteDocumentsByPath(ctx context.Context, indexName, projectID
 
 	status, task, err := c.request(ctx, http.MethodPost, fmt.Sprintf("/indexes/%s/documents/delete", indexName), payload)
 	if err != nil {
-		return fmt.Errorf("delete documents for %q path %q: %w", indexName, relativePath, err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "meili", fmt.Sprintf("delete documents for %q path %q", indexName, relativePath))
 	}
 
 	if status != http.StatusAccepted {
-		return fmt.Errorf("delete documents for %q path %q: unexpected status %d", indexName, relativePath, status)
+		return derrors.New(derrors.CodeUnavailable, "meili", fmt.Sprintf("delete documents for %q path %q: unexpected status %d", indexName, relativePath, status))
 	}
 
 	return c.waitTask(ctx, task.TaskUID)
@@ -485,14 +485,14 @@ func (c *Client) request(ctx context.Context, method, path string, payload any) 
 	if payload != nil {
 		raw, err := json.Marshal(payload)
 		if err != nil {
-			return 0, taskEnvelope{}, fmt.Errorf("marshal request payload: %w", err)
+			return 0, taskEnvelope{}, derrors.Wrap(err, derrors.CodeUnavailable, "meili", "marshal request payload")
 		}
 		body = bytes.NewReader(raw)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, c.host+path, body)
 	if err != nil {
-		return 0, taskEnvelope{}, fmt.Errorf("create request: %w", err)
+		return 0, taskEnvelope{}, derrors.Wrap(err, derrors.CodeUnavailable, "meili", "create request")
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -508,11 +508,11 @@ func (c *Client) request(ctx context.Context, method, path string, payload any) 
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return resp.StatusCode, taskEnvelope{}, fmt.Errorf("read response body: %w", err)
+		return resp.StatusCode, taskEnvelope{}, derrors.Wrap(err, derrors.CodeUnavailable, "meili", "read response body")
 	}
 
 	if resp.StatusCode >= 400 {
-		return resp.StatusCode, taskEnvelope{}, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		return resp.StatusCode, taskEnvelope{}, derrors.New(derrors.CodeUnavailable, "meili", fmt.Sprintf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(raw))))
 	}
 
 	if len(raw) == 0 {
@@ -521,7 +521,7 @@ func (c *Client) request(ctx context.Context, method, path string, payload any) 
 
 	var task taskEnvelope
 	if err := json.Unmarshal(raw, &task); err != nil {
-		return resp.StatusCode, taskEnvelope{}, fmt.Errorf("unmarshal meilisearch response: %w", err)
+		return resp.StatusCode, taskEnvelope{}, derrors.Wrap(err, derrors.CodeUnavailable, "meili", "unmarshal meilisearch response")
 	}
 
 	return resp.StatusCode, task, nil
@@ -532,26 +532,29 @@ func (c *Client) waitTask(ctx context.Context, taskUID int64) error {
 	if taskUID <= 0 {
 		return nil
 	}
-
-	tctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
+	if ctx == nil {
+		return derrors.New(derrors.CodeInvalid, "meili.waitTask", "context is required")
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		return derrors.New(derrors.CodeDeadline, "meili.waitTask", "context deadline is required")
+	}
 	attempt := 0
 
 	for {
 		select {
-		case <-tctx.Done():
-			return fmt.Errorf("timeout waiting for meilisearch task %d: %w", taskUID, tctx.Err())
+		case <-ctx.Done():
+			return derrors.Wrap(ctx.Err(), derrors.CodeDeadline, "meili.waitTask", fmt.Sprintf("waiting for meilisearch task %d", taskUID))
 		default:
 		}
 
-		status, raw, err := c.taskStatus(tctx, taskUID)
+		status, raw, err := c.taskStatus(ctx, taskUID)
 		if err != nil {
 			if isTransientError(err) {
 				attempt++
 				time.Sleep(retryBackoff(attempt))
 				continue
 			}
-			return fmt.Errorf("query meilisearch task %d status: %w", taskUID, err)
+			return derrors.Wrap(err, derrors.CodeUnavailable, "meili.waitTask", fmt.Sprintf("query meilisearch task %d status", taskUID))
 		}
 		attempt = 0
 
@@ -560,7 +563,7 @@ func (c *Client) waitTask(ctx context.Context, taskUID int64) error {
 		}
 
 		if status == "failed" {
-			return fmt.Errorf("meilisearch task %d failed: %s", taskUID, raw)
+			return derrors.New(derrors.CodeUnavailable, "meili.waitTask", fmt.Sprintf("meilisearch task %d failed: %s", taskUID, raw))
 		}
 
 		time.Sleep(300 * time.Millisecond)
@@ -570,7 +573,7 @@ func (c *Client) waitTask(ctx context.Context, taskUID int64) error {
 func (c *Client) taskStatus(ctx context.Context, taskUID int64) (string, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s/tasks/%d", c.host, taskUID), nil)
 	if err != nil {
-		return "", "", fmt.Errorf("create task status request: %w", err)
+		return "", "", derrors.Wrap(err, derrors.CodeUnavailable, "meili", "create task status request")
 	}
 
 	if c.masterKey != "" {
@@ -585,18 +588,18 @@ func (c *Client) taskStatus(ctx context.Context, taskUID int64) (string, string,
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", "", fmt.Errorf("read task status body: %w", err)
+		return "", "", derrors.Wrap(err, derrors.CodeUnavailable, "meili", "read task status body")
 	}
 
 	if resp.StatusCode >= 400 {
-		return "", string(raw), fmt.Errorf("task lookup failed: status %d", resp.StatusCode)
+		return "", string(raw), derrors.New(derrors.CodeUnavailable, "meili", fmt.Sprintf("task lookup failed: status %d", resp.StatusCode))
 	}
 
 	var payload struct {
 		Status string `json:"status"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
-		return "", string(raw), fmt.Errorf("unmarshal task status: %w", err)
+		return "", string(raw), derrors.Wrap(err, derrors.CodeUnavailable, "meili", "unmarshal task status")
 	}
 
 	return payload.Status, string(raw), nil

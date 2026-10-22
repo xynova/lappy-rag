@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"sort"
@@ -20,6 +19,7 @@ import (
 	"github.com/xynova/lappy-rag/internal/clients/ingest"
 	"github.com/xynova/lappy-rag/internal/clients/localai"
 	"github.com/xynova/lappy-rag/internal/clients/meili"
+	derrors "github.com/xynova/lappy-rag/internal/errors"
 	"github.com/xynova/lappy-rag/internal/observability"
 )
 
@@ -35,6 +35,7 @@ type app struct {
 	ingestClient         *ingest.Client
 	localAIClient        *localai.Client
 	proxyClient          *localai.Client
+	logger               *observability.Logger
 }
 
 // Run starts the MCP HTTP server (blocking).
@@ -48,44 +49,45 @@ func Serve(ctx context.Context) error {
 	traceCfgPath := observability.DetectOpenInferenceConfigPath()
 	traceCfg, err := observability.LoadOpenInferenceConfigFromFile(traceCfgPath, "mcp-server")
 	if err != nil {
-		return fmt.Errorf("load openinference config: %w", err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "mcpserver.Serve", "load openinference config")
 	}
 	traceServiceName := observability.ServiceNameFromConfig(&traceCfg)
+	logger := observability.NewLogger("mcp-server")
 
 	if traceCfg.Enabled {
 		provider, err := observability.InitOTEL(traceServiceName, traceCfg.Endpoint)
 		if err != nil {
-			return fmt.Errorf("initialize openinference tracer provider: %w", err)
+			return derrors.Wrap(err, derrors.CodeUnavailable, "mcpserver.Serve", "initialize openinference tracer provider")
 		}
 		defer func() {
 			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if err := observability.ShutdownOTEL(shutdownCtx, provider); err != nil {
-				log.Printf("warning: failed to shutdown openinference tracer provider: %v", err)
+				logger.Warnf("failed to shutdown openinference tracer provider: %v", err)
 			}
 		}()
 	}
 
 	meiliClient, err := meili.New()
 	if err != nil {
-		return fmt.Errorf("initialize meilisearch client: %w", err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "mcpserver.Serve", "initialize meilisearch client")
 	}
 
 	ingestClient, err := ingest.New()
 	if err != nil {
-		return fmt.Errorf("initialize ingest client: %w", err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "mcpserver.Serve", "initialize ingest client")
 	}
 
 	proxyTimeout := time.Duration(getenvInt("LOCALAI_PROXY_TIMEOUT_SECONDS", 180)) * time.Second
 
 	localAIClient, err := localai.New()
 	if err != nil {
-		return fmt.Errorf("initialize localai client: %w", err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "mcpserver.Serve", "initialize localai client")
 	}
 
 	proxyClient, err := localai.New()
 	if err != nil {
-		return fmt.Errorf("initialize localai proxy client: %w", err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "mcpserver.Serve", "initialize localai proxy client")
 	}
 
 	a := &app{
@@ -100,14 +102,15 @@ func Serve(ctx context.Context) error {
 		ingestClient:         ingestClient,
 		localAIClient:        localAIClient,
 		proxyClient:          proxyClient,
+		logger:               logger,
 	}
 
 	if a.meiliIndex == "" {
-		return fmt.Errorf("MEILI_INDEX is required")
+		return derrors.New(derrors.CodeInvalid, "mcpserver.Serve", "MEILI_INDEX is required")
 	}
 
 	mcpServer := server.NewMCPServer(
-		"local-docs",
+		"lappy-rag",
 		"1.0.0",
 		server.WithToolCapabilities(false),
 		server.WithRecovery(),
@@ -141,7 +144,7 @@ func Serve(ctx context.Context) error {
 		IdleTimeout:       proxyTimeout + 60*time.Second,
 	}
 
-	return listenAndServe(ctx, httpServer, nil)
+	return listenAndServe(ctx, httpServer, logger, nil)
 }
 
 func (a *app) registerTools(mcpServer *server.MCPServer) {
@@ -254,7 +257,7 @@ func (a *app) handleAskDocs(ctx context.Context, request mcp.CallToolRequest) (*
 	}
 	question = strings.TrimSpace(question)
 	if question == "" {
-		handlerErr = fmt.Errorf("question is required")
+		handlerErr = derrors.New(derrors.CodeInvalid, "mcpserver", "question is required")
 		return mcp.NewToolResultError("question is required"), nil
 	}
 
@@ -300,7 +303,7 @@ func (a *app) handleAskDocs(ctx context.Context, request mcp.CallToolRequest) (*
 	}
 
 	if confirmIntent && confirmed && planID == "" {
-		handlerErr = fmt.Errorf("plan_id is required when confirm_intent=true and confirmed=true")
+		handlerErr = derrors.New(derrors.CodeInvalid, "mcpserver", "plan_id is required when confirm_intent=true and confirmed=true")
 		return mcp.NewToolResultError("plan_id is required when confirm_intent=true and confirmed=true"), nil
 	}
 
@@ -333,7 +336,7 @@ func (a *app) handleGetDocument(ctx context.Context, request mcp.CallToolRequest
 	}
 	pathOrID = strings.TrimSpace(pathOrID)
 	if pathOrID == "" {
-		handlerErr = fmt.Errorf("path_or_id is required")
+		handlerErr = derrors.New(derrors.CodeInvalid, "mcpserver", "path_or_id is required")
 		return mcp.NewToolResultError("path_or_id is required"), nil
 	}
 
@@ -433,7 +436,7 @@ func parseTriggerParams(request mcp.CallToolRequest) (triggerIngestParams, error
 	}
 	projectID = strings.TrimSpace(projectID)
 	if projectID == "" {
-		return triggerIngestParams{}, fmt.Errorf("project_id is required")
+		return triggerIngestParams{}, derrors.New(derrors.CodeInvalid, "mcpserver", "project_id is required")
 	}
 
 	mode := strings.ToLower(strings.TrimSpace(request.GetString("mode", "full")))
@@ -441,7 +444,7 @@ func parseTriggerParams(request mcp.CallToolRequest) (triggerIngestParams, error
 		mode = "full"
 	}
 	if mode != "full" && mode != "incremental" && mode != "watch" {
-		return triggerIngestParams{}, fmt.Errorf("mode must be one of full|incremental|watch")
+		return triggerIngestParams{}, derrors.New(derrors.CodeInvalid, "mcpserver", "mode must be one of full|incremental|watch")
 	}
 
 	timeoutSeconds := request.GetInt("timeout_seconds", 900)
@@ -474,7 +477,7 @@ func (a *app) handleTriggerIngest(ctx context.Context, request mcp.CallToolReque
 	}
 
 	if params.wait && params.mode == "watch" {
-		handlerErr = fmt.Errorf("wait=true is not supported for mode=watch; use wait=false")
+		handlerErr = derrors.New(derrors.CodeInvalid, "mcpserver", "wait=true is not supported for mode=watch; use wait=false")
 		return mcp.NewToolResultError("wait=true is not supported for mode=watch; use wait=false"), nil
 	}
 
@@ -526,8 +529,8 @@ func formatHits(hits []map[string]any) []map[string]any {
 		out = append(out, trimmed)
 	}
 	sort.Slice(out, func(i, j int) bool {
-		left, _ := out[i]["chunk_index"].(float64)
-		right, _ := out[j]["chunk_index"].(float64)
+		left := chunkIndex(out[i])
+		right := chunkIndex(out[j])
 		return left < right
 	})
 	return out
@@ -536,16 +539,33 @@ func formatHits(hits []map[string]any) []map[string]any {
 func parseProxyBody(r *http.Request) (map[string]any, bool, error) {
 	rawBody, err := io.ReadAll(r.Body)
 	if err != nil {
-		return nil, false, fmt.Errorf("read request body: %w", err)
+		return nil, false, derrors.Wrap(err, derrors.CodeInvalid, "mcpserver.parseProxyBody", "read request body")
 	}
 	payload := map[string]any{}
 	if len(rawBody) > 0 {
 		if err := json.Unmarshal(rawBody, &payload); err != nil {
-			return nil, false, fmt.Errorf("parse request body: %w", err)
+			return nil, false, derrors.Wrap(err, derrors.CodeInvalid, "mcpserver.parseProxyBody", "parse request body")
 		}
 	}
-	stream, _ := payload["stream"].(bool)
+	stream, ok := payload["stream"].(bool)
+	if !ok {
+		stream = false
+	}
 	return payload, stream, nil
+}
+
+func chunkIndex(hit map[string]any) float64 {
+	switch v := hit["chunk_index"].(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	case json.Number:
+		f, _ := v.Float64()
+		return f
+	default:
+		return 0
+	}
 }
 
 func sendSSECompletion(w http.ResponseWriter, content, model string) {
@@ -567,7 +587,7 @@ func sendSSECompletion(w http.ResponseWriter, content, model string) {
 	}
 	chunk(map[string]any{"content": ""}, "stop")
 	if _, err := w.Write([]byte("data: [DONE]\n\n")); err != nil {
-		log.Printf("failed to write stream completion event: %v", err)
+		observability.NewLogger("mcp-server").Warnf("failed to write stream completion event: %v", err)
 	}
 }
 
@@ -604,7 +624,7 @@ func (a *app) handleLocalAIProxyChatCompletions(w http.ResponseWriter, r *http.R
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(statusCode)
 		if _, err := w.Write(body); err != nil {
-			log.Printf("failed to write proxy response: %v", err)
+			a.logger.Warnf("failed to write proxy response: %v", err)
 		}
 		return
 	}
@@ -648,10 +668,10 @@ func extractOpenAIChatContent(body []byte) (string, error) {
 		} `json:"choices"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", fmt.Errorf("parse localai response: %w", err)
+		return "", derrors.Wrap(err, derrors.CodeUnavailable, "mcpserver.extractOpenAIChatContent", "parse localai response")
 	}
 	if len(parsed.Choices) == 0 {
-		return "", fmt.Errorf("localai response did not include choices")
+		return "", derrors.New(derrors.CodeUnavailable, "mcpserver.extractOpenAIChatContent", "localai response did not include choices")
 	}
 	return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
 }
@@ -659,7 +679,7 @@ func extractOpenAIChatContent(body []byte) (string, error) {
 func (a *app) forwardLocalAIRequest(ctx context.Context, payload map[string]any) (int, []byte, error) {
 	statusCode, body, err := a.proxyClient.ChatCompletions(ctx, payload)
 	if err != nil {
-		return 0, nil, fmt.Errorf("execute proxy request: %w", err)
+		return 0, nil, derrors.Wrap(err, derrors.CodeUnavailable, "mcpserver.forwardLocalAIRequest", "execute proxy request")
 	}
 
 	return statusCode, body, nil
@@ -669,7 +689,7 @@ func writeJSON(w http.ResponseWriter, statusCode int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
 	if err := json.NewEncoder(w).Encode(payload); err != nil {
-		log.Printf("failed to write response: %v", err)
+		observability.NewLogger("mcp-server").Warnf("failed to write response: %v", err)
 	}
 }
 

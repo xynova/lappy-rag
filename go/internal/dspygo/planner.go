@@ -3,13 +3,13 @@ package dspygo
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strings"
 
 	dspycore "github.com/XiaoConstantine/dspy-go/pkg/core"
 	"github.com/XiaoConstantine/dspy-go/pkg/llms"
 	"github.com/XiaoConstantine/dspy-go/pkg/modules"
 
+	derrors "github.com/xynova/lappy-rag/internal/errors"
 	"github.com/xynova/lappy-rag/internal/observability"
 )
 
@@ -121,32 +121,40 @@ func (p *Planner) buildWithLLM(ctx context.Context, question string) (Plan, erro
 		"question": question,
 	})
 	if err != nil {
-		return Plan{}, fmt.Errorf("cot.Process: %w", err)
+		return Plan{}, derrors.Wrap(err, derrors.CodeUnavailable, "dspygo.buildWithLLM", "cot.Process")
 	}
 
-	primary, _ := result["primary_query"].(string)
+	primary, ok := result["primary_query"].(string)
+	if !ok {
+		return Plan{}, derrors.New(derrors.CodeInvalid, "dspygo.buildWithLLM", "primary_query missing or not a string")
+	}
 	primary = strings.TrimSpace(primary)
 	if primary == "" {
-		return Plan{}, fmt.Errorf("empty primary_query in response")
+		return Plan{}, derrors.New(derrors.CodeInvalid, "dspygo.buildWithLLM", "empty primary_query in response")
 	}
 
 	unique := map[string]struct{}{strings.ToLower(primary): {}}
 	queries := []string{primary}
 
-	raw, _ := result["expanded_queries"].(string)
+	raw := ""
+	if rawVal, rawOK := result["expanded_queries"].(string); rawOK {
+		raw = rawVal
+	}
 	var expanded []string
-	if err := json.Unmarshal([]byte(raw), &expanded); err == nil {
-		for _, q := range expanded {
-			q = strings.TrimSpace(q)
-			if q == "" {
-				continue
+	if raw != "" {
+		if err := json.Unmarshal([]byte(raw), &expanded); err == nil {
+			for _, q := range expanded {
+				q = strings.TrimSpace(q)
+				if q == "" {
+					continue
+				}
+				k := strings.ToLower(q)
+				if _, seen := unique[k]; seen {
+					continue
+				}
+				unique[k] = struct{}{}
+				queries = append(queries, q)
 			}
-			k := strings.ToLower(q)
-			if _, seen := unique[k]; seen {
-				continue
-			}
-			unique[k] = struct{}{}
-			queries = append(queries, q)
 		}
 	}
 

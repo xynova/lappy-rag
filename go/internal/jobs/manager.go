@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/xynova/lappy-rag/internal/clients/meili"
+	derrors "github.com/xynova/lappy-rag/internal/errors"
 	"github.com/xynova/lappy-rag/internal/profiles"
 	"github.com/xynova/lappy-rag/internal/registry"
 )
@@ -93,11 +94,13 @@ type DocumentWriter interface {
 	DeleteDocumentsByPath(ctx context.Context, indexName, projectID, relativePath string) error
 }
 
-// SearchClient defines indexing operations used by ingest runs.
+// SearchClient is a test/fake convenience that implements both ingest search seams.
 type SearchClient interface {
 	IndexAdminClient
 	DocumentWriter
 }
+
+var _ SearchClient = (*meili.Client)(nil)
 
 // StateStore persists per-project ingest state.
 type StateStore interface {
@@ -135,6 +138,50 @@ type fileStateStore struct {
 	stateDir string
 }
 
+// ManagerConfig holds construction inputs for Manager.
+type ManagerConfig struct {
+	MaxGlobal     int
+	MaxPerProject int
+	AllowSymlinks bool
+	Projects      *registry.Config
+	IndexAdmin    IndexAdminClient
+	Documents     DocumentWriter
+	State         StateStore
+	Clock         Clock
+}
+
+// CreateManager builds a Manager from Config. Required deps must be non-nil.
+func (cfg ManagerConfig) CreateManager() *Manager {
+	if cfg.Projects == nil {
+		panic("projectsCfg cannot be nil")
+	}
+	if cfg.IndexAdmin == nil {
+		panic("indexAdmin cannot be nil")
+	}
+	if cfg.Documents == nil {
+		panic("documents cannot be nil")
+	}
+	if cfg.State == nil {
+		panic("stateStore cannot be nil")
+	}
+	if cfg.Clock == nil {
+		panic("clock cannot be nil")
+	}
+
+	return &Manager{
+		jobs:                    make(map[string]*Job),
+		projects:                cfg.Projects,
+		maxConcurrentJobs:       cfg.MaxGlobal,
+		maxConcurrentPerProject: cfg.MaxPerProject,
+		activeByProject:         make(map[string]int),
+		indexAdmin:              cfg.IndexAdmin,
+		documents:               cfg.Documents,
+		stateStore:              cfg.State,
+		clock:                   cfg.Clock,
+		allowSymlinks:           cfg.AllowSymlinks,
+	}
+}
+
 type Manager struct {
 	mu                      sync.RWMutex
 	jobs                    map[string]*Job
@@ -143,37 +190,16 @@ type Manager struct {
 	maxConcurrentPerProject int
 	activeGlobal            int
 	activeByProject         map[string]int
-	searchClient            SearchClient
+	indexAdmin              IndexAdminClient
+	documents               DocumentWriter
 	stateStore              StateStore
 	clock                   Clock
 	allowSymlinks           bool
 }
 
-func NewManager(maxGlobal, maxPerProject int, allowSymlinks bool, projectsCfg *registry.Config, searchClient SearchClient, stateStore StateStore, clock Clock) *Manager {
-	if projectsCfg == nil {
-		panic("projectsCfg cannot be nil")
-	}
-	if searchClient == nil {
-		panic("searchClient cannot be nil")
-	}
-	if stateStore == nil {
-		panic("stateStore cannot be nil")
-	}
-	if clock == nil {
-		panic("clock cannot be nil")
-	}
-
-	return &Manager{
-		jobs:                    make(map[string]*Job),
-		projects:                projectsCfg,
-		maxConcurrentJobs:       maxGlobal,
-		maxConcurrentPerProject: maxPerProject,
-		activeByProject:         make(map[string]int),
-		searchClient:            searchClient,
-		stateStore:              stateStore,
-		clock:                   clock,
-		allowSymlinks:           allowSymlinks,
-	}
+type searchDeps struct {
+	admin IndexAdminClient
+	docs  DocumentWriter
 }
 
 func (m *Manager) Reload(projectsCfg *registry.Config) {
@@ -211,7 +237,7 @@ func (m *Manager) Enqueue(ctx context.Context, input EnqueueInput) (*Job, error)
 	}
 
 	if m.activeGlobal >= m.maxConcurrentJobs {
-		return nil, fmt.Errorf("global concurrency limit reached")
+		return nil, derrors.New(derrors.CodeConflict, "jobs.Enqueue", "global concurrency limit reached")
 	}
 
 	if m.activeByProject[input.ProjectID] >= m.maxConcurrentPerProject {
@@ -220,7 +246,7 @@ func (m *Manager) Enqueue(ctx context.Context, input EnqueueInput) (*Job, error)
 				return cloneJob(j), nil
 			}
 		}
-		return nil, fmt.Errorf("project %q already has maximum active jobs", input.ProjectID)
+		return nil, derrors.New(derrors.CodeConflict, "jobs.Enqueue", fmt.Sprintf("project %q already has maximum active jobs", input.ProjectID))
 	}
 
 	now := m.clock.Now()
@@ -308,7 +334,7 @@ func (m *Manager) setRunning(jobID string) Mode {
 }
 
 func (m *Manager) runOnce(ctx context.Context, project registry.Project, mode Mode) (*RunStats, error) {
-	return RunOnceWithDeps(ctx, project, mode, m.allowSymlinks, m.searchClient, m.stateStore, m.clock)
+	return RunOnceWithDeps(ctx, project, mode, m.allowSymlinks, m.indexAdmin, m.documents, m.stateStore, m.clock)
 }
 
 type RunStats struct {
@@ -329,19 +355,19 @@ type RunStats struct {
 func RunOnce(ctx context.Context, project registry.Project, mode Mode) (*RunStats, error) {
 	searchClient, err := meili.New()
 	if err != nil {
-		return nil, fmt.Errorf("initialize meilisearch client: %w", err)
+		return nil, derrors.Wrap(err, derrors.CodeUnavailable, "jobs.RunOnce", "initialize meilisearch client")
 	}
 
 	allowSymlinks := strings.EqualFold(strings.TrimSpace(os.Getenv("ALLOW_FOLLOW_SYMLINKS")), "true")
 	stateStore := NewFileStateStore(strings.TrimSpace(os.Getenv("STATE_DIR")))
 	clock := NewRealClock()
 
-	return RunOnceWithDeps(ctx, project, mode, allowSymlinks, searchClient, stateStore, clock)
+	return RunOnceWithDeps(ctx, project, mode, allowSymlinks, searchClient, searchClient, stateStore, clock)
 }
 
 // RunOnceWithDeps runs a full or incremental ingest for the given project with
 // all dependencies provided by the caller.
-func RunOnceWithDeps(ctx context.Context, project registry.Project, mode Mode, allowSymlinks bool, searchClient SearchClient, stateStore StateStore, clock Clock) (*RunStats, error) {
+func RunOnceWithDeps(ctx context.Context, project registry.Project, mode Mode, allowSymlinks bool, indexAdmin IndexAdminClient, documents DocumentWriter, stateStore StateStore, clock Clock) (*RunStats, error) {
 	projectPath := project.ScanPath()
 
 	stats := &RunStats{
@@ -350,9 +376,23 @@ func RunOnceWithDeps(ctx context.Context, project registry.Project, mode Mode, a
 		Mode:      mode,
 	}
 
+	if indexAdmin == nil {
+		return nil, derrors.New(derrors.CodeInvalid, "jobs.RunOnceWithDeps", "index admin is required")
+	}
+	if documents == nil {
+		return nil, derrors.New(derrors.CodeInvalid, "jobs.RunOnceWithDeps", "document writer is required")
+	}
+	if stateStore == nil {
+		return nil, derrors.New(derrors.CodeInvalid, "jobs.RunOnceWithDeps", "state store is required")
+	}
+	if clock == nil {
+		return nil, derrors.New(derrors.CodeInvalid, "jobs.RunOnceWithDeps", "clock is required")
+	}
+	deps := searchDeps{admin: indexAdmin, docs: documents}
+
 	state, err := stateStore.LoadProjectState(project.ID)
 	if err != nil {
-		return nil, fmt.Errorf("load project state for %q: %w", project.ID, err)
+		return nil, derrors.Wrap(err, derrors.CodeUnavailable, "jobs.RunOnceWithDeps", fmt.Sprintf("load project state for %q", project.ID))
 	}
 
 	nextState := &projectState{
@@ -360,61 +400,61 @@ func RunOnceWithDeps(ctx context.Context, project registry.Project, mode Mode, a
 		Files:     make(map[string]string),
 	}
 
-	if err := configureIndex(ctx, searchClient, project, mode); err != nil {
+	if err := configureIndex(ctx, deps, project, mode); err != nil {
 		return nil, err
 	}
 
-	docs, err := scanProjectDocuments(ctx, searchClient, project, projectPath, mode, allowSymlinks, state, nextState, stats, clock)
+	docs, err := scanProjectDocuments(ctx, deps, project, projectPath, mode, allowSymlinks, state, nextState, stats, clock)
 	if err != nil {
-		return nil, fmt.Errorf("scan project content: %w", err)
+		return nil, derrors.Wrap(err, derrors.CodeUnavailable, "jobs.RunOnceWithDeps", "scan project content")
 	}
 
-	if err := reconcileDeletedDocuments(ctx, searchClient, project, mode, state, nextState, stats); err != nil {
+	if err := reconcileDeletedDocuments(ctx, deps, project, mode, state, nextState, stats); err != nil {
 		return nil, err
 	}
 
 	if len(docs) > 0 {
-		written, writeErr := searchClient.AddDocuments(ctx, project.IndexName, docs)
+		written, writeErr := documents.AddDocuments(ctx, project.IndexName, docs)
 		if writeErr != nil {
-			return nil, fmt.Errorf("add final document batch to %q: %w", project.IndexName, writeErr)
+			return nil, derrors.Wrap(writeErr, derrors.CodeUnavailable, "jobs.RunOnceWithDeps", fmt.Sprintf("add final document batch to %q", project.IndexName))
 		}
 		stats.ChunksIndexed += written
 	}
 
 	if err := stateStore.SaveProjectState(nextState); err != nil {
-		return nil, fmt.Errorf("save project state for %q: %w", project.ID, err)
+		return nil, derrors.Wrap(err, derrors.CodeUnavailable, "jobs.RunOnceWithDeps", fmt.Sprintf("save project state for %q", project.ID))
 	}
 
 	return stats, nil
 }
 
-func configureIndex(ctx context.Context, searchClient SearchClient, project registry.Project, mode Mode) error {
-	if err := searchClient.EnableChatCompletions(ctx); err != nil {
-		return fmt.Errorf("enable meilisearch chat completions: %w", err)
+func configureIndex(ctx context.Context, deps searchDeps, project registry.Project, mode Mode) error {
+	if err := deps.admin.EnableChatCompletions(ctx); err != nil {
+		return derrors.Wrap(err, derrors.CodeUnavailable, "jobs.configureIndex", "enable meilisearch chat completions")
 	}
 
-	if err := searchClient.EnsureIndex(ctx, project.IndexName); err != nil {
-		return fmt.Errorf("ensure index %q: %w", project.IndexName, err)
+	if err := deps.admin.EnsureIndex(ctx, project.IndexName); err != nil {
+		return derrors.Wrap(err, derrors.CodeUnavailable, "jobs.configureIndex", fmt.Sprintf("ensure index %q", project.IndexName))
 	}
 
 	// Cancel any stuck background tasks (e.g. a failing re-embed loop) before
 	// applying settings — otherwise the new settings task sits enqueued behind
 	// them and times out waiting to start.
-	if err := searchClient.CancelIndexTasks(ctx, project.IndexName); err != nil {
-		return fmt.Errorf("cancel pending tasks for index %q: %w", project.IndexName, err)
+	if err := deps.admin.CancelIndexTasks(ctx, project.IndexName); err != nil {
+		return derrors.Wrap(err, derrors.CodeUnavailable, "jobs.configureIndex", fmt.Sprintf("cancel pending tasks for index %q", project.IndexName))
 	}
 
-	if err := searchClient.ApplySettings(ctx, project.IndexName); err != nil {
-		return fmt.Errorf("apply index settings for %q: %w", project.IndexName, err)
+	if err := deps.admin.ApplySettings(ctx, project.IndexName); err != nil {
+		return derrors.Wrap(err, derrors.CodeUnavailable, "jobs.configureIndex", fmt.Sprintf("apply index settings for %q", project.IndexName))
 	}
 
-	if err := searchClient.ApplyEmbedders(ctx, project.IndexName); err != nil {
-		return fmt.Errorf("apply embedders for %q: %w", project.IndexName, err)
+	if err := deps.admin.ApplyEmbedders(ctx, project.IndexName); err != nil {
+		return derrors.Wrap(err, derrors.CodeUnavailable, "jobs.configureIndex", fmt.Sprintf("apply embedders for %q", project.IndexName))
 	}
 
 	if mode == ModeFull {
-		if err := searchClient.DeleteAllDocuments(ctx, project.IndexName); err != nil {
-			return fmt.Errorf("delete all documents for %q: %w", project.IndexName, err)
+		if err := deps.docs.DeleteAllDocuments(ctx, project.IndexName); err != nil {
+			return derrors.Wrap(err, derrors.CodeUnavailable, "jobs.configureIndex", fmt.Sprintf("delete all documents for %q", project.IndexName))
 		}
 	}
 
@@ -434,7 +474,7 @@ func shouldSkipDirEntry(d fs.DirEntry, path string, allowedExtensions map[string
 
 func processScannedEntry(
 	ctx context.Context,
-	searchClient SearchClient,
+	deps searchDeps,
 	project registry.Project,
 	path, projectPath string,
 	mode Mode,
@@ -458,17 +498,17 @@ func processScannedEntry(
 			stats.FilesSkipped++
 			return nil
 		}
-		if err := searchClient.DeleteDocumentsByPath(ctx, project.IndexName, project.ID, plan.NormalizedPath); err != nil {
-			return fmt.Errorf("delete existing documents for %q at %q: %w", project.IndexName, plan.NormalizedPath, err)
+		if err := deps.docs.DeleteDocumentsByPath(ctx, project.IndexName, project.ID, plan.NormalizedPath); err != nil {
+			return derrors.Wrap(err, derrors.CodeUnavailable, "jobs.processScannedEntry", fmt.Sprintf("delete existing documents for %q at %q", project.IndexName, plan.NormalizedPath))
 		}
 	}
 	stats.FilesChanged++
-	return appendPlannedChunks(ctx, searchClient, project, plan, stats, clock, docs)
+	return appendPlannedChunks(ctx, deps, project, plan, stats, clock, docs)
 }
 
 func scanProjectDocuments(
 	ctx context.Context,
-	searchClient SearchClient,
+	deps searchDeps,
 	project registry.Project,
 	projectPath string,
 	mode Mode,
@@ -493,9 +533,9 @@ func scanProjectDocuments(
 		}
 		raw, readErr := os.ReadFile(path) //nolint:gosec // G304: path is within operator-configured project scan root
 		if readErr != nil {
-			return fmt.Errorf("read markdown file %s: %w", path, readErr)
+			return derrors.Wrap(readErr, derrors.CodeUnavailable, "jobs.scanProjectDocuments", fmt.Sprintf("read markdown file %s", path))
 		}
-		return processScannedEntry(ctx, searchClient, project, path, projectPath, mode, raw, state, nextState, stats, clock, &docs)
+		return processScannedEntry(ctx, deps, project, path, projectPath, mode, raw, state, nextState, stats, clock, &docs)
 	})
 	if err != nil {
 		return nil, err
@@ -526,7 +566,7 @@ func buildDocumentPlan(path, projectPath string, project registry.Project, raw [
 
 	docType, strategy := project.Match(relativePath)
 	if docType == "" || strategy == profiles.ChunkStrategy("") {
-		return nil, fmt.Errorf("invalid profile resolution for %s", relativePath)
+		return nil, derrors.New(derrors.CodeInvalid, "jobs.buildDocumentPlan", fmt.Sprintf("invalid profile resolution for %s", relativePath))
 	}
 
 	return &documentPlan{
@@ -541,7 +581,7 @@ func buildDocumentPlan(path, projectPath string, project registry.Project, raw [
 
 func appendPlannedChunks(
 	ctx context.Context,
-	searchClient SearchClient,
+	deps searchDeps,
 	project registry.Project,
 	plan *documentPlan,
 	stats *RunStats,
@@ -581,9 +621,9 @@ func appendPlannedChunks(
 			continue
 		}
 
-		written, writeErr := searchClient.AddDocuments(ctx, project.IndexName, *docs)
+		written, writeErr := deps.docs.AddDocuments(ctx, project.IndexName, *docs)
 		if writeErr != nil {
-			return fmt.Errorf("add document batch to %q: %w", project.IndexName, writeErr)
+			return derrors.Wrap(writeErr, derrors.CodeUnavailable, "jobs.appendPlannedChunks", fmt.Sprintf("add document batch to %q", project.IndexName))
 		}
 		stats.ChunksIndexed += written
 		*docs = (*docs)[:0]
@@ -594,7 +634,7 @@ func appendPlannedChunks(
 
 func reconcileDeletedDocuments(
 	ctx context.Context,
-	searchClient SearchClient,
+	deps searchDeps,
 	project registry.Project,
 	mode Mode,
 	state *projectState,
@@ -610,8 +650,8 @@ func reconcileDeletedDocuments(
 			continue
 		}
 
-		if err := searchClient.DeleteDocumentsByPath(ctx, project.IndexName, project.ID, oldPath); err != nil {
-			return fmt.Errorf("delete removed file documents for %q at %q: %w", project.IndexName, oldPath, err)
+		if err := deps.docs.DeleteDocumentsByPath(ctx, project.IndexName, project.ID, oldPath); err != nil {
+			return derrors.Wrap(err, derrors.CodeUnavailable, "jobs.reconcileDeletedDocuments", fmt.Sprintf("delete removed file documents for %q at %q", project.IndexName, oldPath))
 		}
 		stats.FilesDeleted++
 	}
@@ -866,12 +906,12 @@ func (s *fileStateStore) LoadProjectState(projectID string) (*projectState, erro
 		if os.IsNotExist(err) {
 			return &projectState{ProjectID: projectID, Files: make(map[string]string)}, nil
 		}
-		return nil, fmt.Errorf("read state file for %q: %w", projectID, err)
+		return nil, derrors.Wrap(err, derrors.CodeUnavailable, "jobs.LoadProjectState", fmt.Sprintf("read state file for %q", projectID))
 	}
 
 	var state projectState
 	if err := json.Unmarshal(raw, &state); err != nil {
-		return nil, fmt.Errorf("parse state file for %q: %w", projectID, err)
+		return nil, derrors.Wrap(err, derrors.CodeUnavailable, "jobs.LoadProjectState", fmt.Sprintf("parse state file for %q", projectID))
 	}
 
 	if state.Files == nil {
@@ -888,21 +928,21 @@ func (s *fileStateStore) LoadProjectState(projectID string) (*projectState, erro
 func (s *fileStateStore) SaveProjectState(state *projectState) error {
 	path := s.stateFilePath(state.ProjectID)
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		return fmt.Errorf("create state directory: %w", err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "jobs.SaveProjectState", "create state directory")
 	}
 
 	raw, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encode state for %q: %w", state.ProjectID, err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "jobs.SaveProjectState", fmt.Sprintf("encode state for %q", state.ProjectID))
 	}
 
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return fmt.Errorf("write temp state for %q: %w", state.ProjectID, err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "jobs.SaveProjectState", fmt.Sprintf("write temp state for %q", state.ProjectID))
 	}
 
 	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("swap state file for %q: %w", state.ProjectID, err)
+		return derrors.Wrap(err, derrors.CodeUnavailable, "jobs.SaveProjectState", fmt.Sprintf("swap state file for %q", state.ProjectID))
 	}
 
 	return nil

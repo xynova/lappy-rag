@@ -6,7 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/xynova/lappy-rag/internal/cli/shared"
+	"github.com/xynova/lappy-rag/internal/cli/guide"
 	"github.com/xynova/lappy-rag/internal/mcpserver"
 )
 
@@ -19,7 +19,7 @@ func main() {
 		Short:        purpose,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return shared.PrintAgentGuide(cmd.OutOrStdout(), "mcp-server", version, purpose)
+			return guide.PrintAgentGuide(cmd.OutOrStdout(), "mcp-server", version, purpose)
 		},
 	}
 
