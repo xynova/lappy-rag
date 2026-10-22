@@ -1,0 +1,20 @@
+id: mesh-docs
+paths:
+	volume:
+		host: ${CONTENT_ROOT_BASE}/mesh-docs
+		container: /content/projects/mesh-docs
+index_name: docs_mesh_docs
+rules:
+	- match_path_prefix: src/
+		doc_type: code
+		chunk_strategy: code_markdown
+	- match_path_prefix: sops/
+		doc_type: sop
+		chunk_strategy: markdown
+	- match_path_prefix: mesh/
+		doc_type: confluence
+		chunk_strategy: markdown
+default:
+	doc_type: generic
+	chunk_strategy: markdown
+enabled: true

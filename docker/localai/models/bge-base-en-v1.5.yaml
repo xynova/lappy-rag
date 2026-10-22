@@ -1,0 +1,10 @@
+# BGE-base-en-v1.5 — text embedding model (768-dim)
+# Converted from HuggingFace format to GGUF f16 at image build time.
+# The llama backend (llama.cpp) handles BERT-architecture GGUF files natively
+# and is the same proven backend used for Gemma4 chat.
+# Served at: POST /v1/embeddings  (model: "bge-base-en-v1.5")
+name: bge-base-en-v1.5
+backend: llama
+parameters:
+  model: bge-base-en-v1.5-q4_k_m.gguf
+embeddings: true

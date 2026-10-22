@@ -1,0 +1,31 @@
+# Enforce LF line endings on checkout for all text files.
+# This is critical: Docker and shell scripts silently break on Windows CRLF.
+
+* text=auto
+
+# Shell and Dockerfile — must be LF on all platforms.
+*.sh            text eol=lf
+Dockerfile*     text eol=lf
+
+# Go source and module files.
+*.go            text eol=lf
+*.mod           text eol=lf
+*.sum           text eol=lf
+
+# Config and data files.
+*.yaml          text eol=lf
+*.yml           text eol=lf
+*.json          text eol=lf
+*.env           text eol=lf
+*.env.example   text eol=lf
+
+# Documentation.
+*.md            text eol=lf
+
+# Git metadata.
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+
+# Treat compiled binaries as binary — no line-ending normalisation.
+*.exe           binary
+*.bin           binary

@@ -1,0 +1,132 @@
+name: lappy-rag
+services:
+  # ── LocalAI ─────────────────────────────────────────────────────────────────
+  # OpenAI-compatible API serving embeddings (bge-base-en-v1.5) and chat (gemma-4-12b).
+  localai:
+    build:
+      context: .
+      dockerfile: localai/Dockerfile
+      args:
+        DOCKER_REGISTRY_PROXY: ${DOCKER_REGISTRY_PROXY:-}
+        CORP_CA_CERT_URL: ${CORP_CA_CERT_URL:-}
+    entrypoint: ["/local-ai"]
+    command: ["run"]
+    volumes:
+      - type: bind
+        source: ./localai/models/gemma-4-12b.yaml
+        target: /build/models/gemma-4-12b.yaml
+        read_only: true
+    environment:
+      MODELS_PATH: /build/models
+      CONTEXT_SIZE: ${LOCALAI_CONTEXT_SIZE:-8192}
+      DEBUG: "true"
+      LOCALAI_SKIP_STARTUP_MODELS: "true"
+      LOCALAI_DISABLE_GALLERY: "true"
+    ports:
+      - "127.0.0.1:${LOCALAI_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/readyz"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+
+  # ── Meilisearch ─────────────────────────────────────────────────────────────
+  meilisearch:
+    image: ${DOCKER_REGISTRY_PROXY:-}getmeili/meilisearch:v1.16.0
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_LOG_LEVEL: ${MEILI_LOG_LEVEL:-WARN}
+      MEILI_EXPERIMENTAL_ALLOWED_IP_NETWORKS: ${MEILI_EXPERIMENTAL_ALLOWED_IP_NETWORKS:-any}
+    ports:
+      - "${MEILI_PORT:-7700}:7700"
+    volumes:
+      - meili_data:/meili_data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ── Ingest + MCP API ────────────────────────────────────────────────────────
+  rag-api:
+    build:
+      context: ..
+      dockerfile: docker/ingest-api.Dockerfile
+      args:
+        DOCKER_REGISTRY_PROXY: ${DOCKER_REGISTRY_PROXY:-}
+        CORP_CA_CERT_URL: ${CORP_CA_CERT_URL:-}
+        GOPROXY: ${GOPROXY:-}
+        GONOSUMCHECK: ${GONOSUMCHECK:-}
+        GOPRIVATE: ${GOPRIVATE:-}
+        GONOSUMDB: ${GONOSUMDB:-}
+        REGISTRY_USER: ${REGISTRY_USER:-}
+        REGISTRY_TOKEN: ${REGISTRY_TOKEN:-}
+        PACKAGE_REGISTRY_HOST: ${PACKAGE_REGISTRY_HOST:-}
+    environment:
+      MEILI_HOST: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_INDEX: ${MEILI_INDEX:-documents}
+      EMBED_URL: ${EMBED_URL:-http://localai:8080/v1}
+      EMBED_MODEL: ${EMBED_MODEL:-bge-base-en-v1.5}
+      EMBED_DIMENSIONS: ${EMBED_DIMENSIONS:-768}
+      EMBED_DOCUMENT_TEMPLATE: ${EMBED_DOCUMENT_TEMPLATE:-}
+      STATE_DIR: ${STATE_DIR:-/app/state}
+      MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-3}
+      MAX_CONCURRENT_PER_PROJECT: ${MAX_CONCURRENT_PER_PROJECT:-1}
+      MCP_PORT: ${MCP_PORT:-3000}
+      MCP_ENABLED_TOOLS: ${MCP_ENABLED_TOOLS:-}
+      MCP_DISABLED_TOOLS: ${MCP_DISABLED_TOOLS:-}
+      INGEST_API_HOST: http://127.0.0.1:8090
+      LOCALAI_BASE_URL: ${LOCALAI_BASE_URL:-http://localai:8080/v1}
+      LOCALAI_CHAT_MODEL: ${LOCALAI_CHAT_MODEL:-gemma-4-12b}
+      LOCALAI_API_KEY: ${LOCALAI_API_KEY:-}
+    ports:
+      - "${INGEST_API_PORT:-8090}:8090"
+      - "127.0.0.1:${MCP_PORT:-3000}:3000"
+    command:
+      [
+        "/bin/sh",
+        "-lc",
+        "trap 'kill 0' INT TERM; /usr/local/bin/ingest-api serve & /usr/local/bin/mcp-server serve & wait -n",
+      ]
+    volumes:
+      - ../configs:/app/configs:ro
+      - ./state:/app/state
+    depends_on:
+      meilisearch:
+        condition: service_healthy
+      localai:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ingest-job:
+    profiles: [manual]
+    build:
+      context: ..
+      dockerfile: docker/ingest-api.Dockerfile
+      args:
+        DOCKER_REGISTRY_PROXY: ${DOCKER_REGISTRY_PROXY:-}
+        CORP_CA_CERT_URL: ${CORP_CA_CERT_URL:-}
+        GOPROXY: ${GOPROXY:-}
+        GONOSUMCHECK: ${GONOSUMCHECK:-}
+        GOPRIVATE: ${GOPRIVATE:-}
+        GONOSUMDB: ${GONOSUMDB:-}
+        REGISTRY_USER: ${REGISTRY_USER:-}
+        REGISTRY_TOKEN: ${REGISTRY_TOKEN:-}
+        PACKAGE_REGISTRY_HOST: ${PACKAGE_REGISTRY_HOST:-}
+    entrypoint: ["/usr/local/bin/ingest-job", "run"]
+    environment:
+      MEILI_HOST: http://meilisearch:7700
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      STATE_DIR: ${STATE_DIR:-/app/state}
+    volumes:
+      - ../configs:/app/configs:ro
+      - ./state:/app/state
+    depends_on:
+      meilisearch:
+        condition: service_healthy
+
+volumes:
+  meili_data:

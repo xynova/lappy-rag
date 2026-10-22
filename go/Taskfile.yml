@@ -1,0 +1,77 @@
+version: "3"
+
+vars:
+  VERSION: '{{.VERSION | default "dev"}}'
+
+tasks:
+  default:
+    desc: List local-dev tasks
+    silent: true
+    cmds:
+      - go tool task --list
+      - |
+        echo ""
+        echo "Next steps:"
+        echo "  1. go tool task format"
+        echo "  2. go tool task lint"
+        echo "  3. go tool task test"
+        echo "  4. go tool task build"
+
+  format:
+    desc: Format Go sources with gofumpt
+    summary: |
+      Runs go tool gofumpt on ./cmd and ./internal.
+    cmds:
+      - go tool gofumpt -w ./cmd ./internal
+
+  lint:
+    desc: Run golangci-lint
+    summary: |
+      Runs go tool golangci-lint on ./cmd/... and ./internal/....
+    cmds:
+      - go tool golangci-lint run --timeout 5m ./cmd/... ./internal/...
+
+  vet:
+    desc: Run go vet
+    summary: |
+      Runs go vet on all packages in this module.
+    cmds:
+      - go vet ./...
+
+  test:
+    desc: Run unit tests
+    summary: |
+      Runs go test on all packages in this module.
+    cmds:
+      - go test ./...
+
+  build:
+    desc: Compile all commands
+    summary: |
+      Runs go build on ./cmd/...
+    cmds:
+      - go build ./cmd/...
+
+  tidy:
+    desc: go mod tidy
+    summary: |
+      Runs go mod tidy in this module.
+    cmds:
+      - go mod tidy
+
+  hooks-install:
+    desc: Install Lefthook git hooks
+    summary: |
+      Runs lefthook install from the product git root (parent of go/).
+    dir: ..
+    cmds:
+      - lefthook install
+
+  qa:
+    desc: format, lint, vet, and test
+    internal: true
+    deps:
+      - format
+      - lint
+      - vet
+      - test
