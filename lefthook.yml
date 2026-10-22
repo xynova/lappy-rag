@@ -1,0 +1,3 @@
+# Fleet hooks (standalone Go module; see install-repo-hooks skill)
+extends:
+  - lefthook/lefthook-go-standalone.yml

@@ -1,0 +1,55 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - errorlint
+    - exhaustive
+    - goconst
+    - gocognit
+    - godot
+    - gosec
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  settings:
+    # Former gocyclo min-complexity 15 until complexity debt is paid down.
+    gocognit:
+      # Raised until ingestapi complexity debt is paid (former gocyclo 15 baseline).
+      min-complexity: 35
+    errcheck:
+      check-defer: false
+    exhaustive:
+      default-signifies-exhaustive: false
+    godot:
+      scope: declarations
+      capital: false
+    gosec:
+      severity: medium
+      confidence: medium
+    goconst:
+      min-len: 4
+      min-occurrences: 14
+      ignore-tests: true
+    staticcheck:
+      checks:
+        - all
+        - -QF1001
+        - -ST1000
+
+formatters:
+  enable:
+    - gofumpt
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    - linters:
+        - errcheck
+      text: "is not checked"

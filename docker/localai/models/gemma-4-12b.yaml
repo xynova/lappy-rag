@@ -1,0 +1,17 @@
+# Gemma 4 12B Instruct — QAT Q4_0 GGUF
+# Multimodal chat model (text + image) served via llama.cpp backend.
+# Served at: POST /v1/chat/completions  (model: "gemma-4-12b")
+name: gemma-4-12b
+backend: llama
+parameters:
+  model: gemma-4-12B-it-QAT-Q4_0.gguf
+context_size: 16384
+f16: false
+mmap: true
+threads: 4
+batch: 128
+temperature: 0.2
+use_jinja: false
+# mmap: true lets the OS page the model rather than loading it all into RAM upfront.
+# context_size baseline is 8192; override at runtime via LOCALAI_CONTEXT_SIZE.
+# Ref: LocalAI issues #9711, #10340 — QAT models OOM-crash the llama-cpp backend.

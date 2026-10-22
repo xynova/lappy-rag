@@ -1,0 +1,12 @@
+# Standalone Go module hooks (no cursor-packs submodule).
+# Consumer: root lefthook.yml extends this file; scripts live under scripts/git-hooks/.
+
+pre-commit:
+  parallel: false
+  commands:
+    default-branch-refuse:
+      run: bash scripts/git-hooks/default-branch-refuse.sh
+    go-format:
+      glob: "*.go"
+      run: bash scripts/git-hooks/go-format-staged.sh {staged_files}
+      stage_fixed: true

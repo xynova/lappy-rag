@@ -1,0 +1,13 @@
+# Gemma 4 12B Instruct (tutor profile) — QAT Q4_0 GGUF
+# Served at: POST /v1/chat/completions (model: "gemma-4-12b-tutor")
+name: gemma-4-12b-tutor
+backend: llama
+parameters:
+  model: gemma-4-12B-it-QAT-Q4_0.gguf
+context_size: 8192
+f16: false
+mmap: true
+threads: 4
+batch: 128
+temperature: 0.3
+use_jinja: false

@@ -1,0 +1,56 @@
+# ── Go ───────────────────────────────────────────────────────────────────────
+# Build cache and vendor directory.
+go/vendor/
+go/testcache/
+
+# ── Docker runtime state ──────────────────────────────────────────────────────
+# State files written by ingest jobs at runtime.
+docker/state/
+
+# Generated per-project content mount overlay — rebuilt by make gen-mounts.
+docker/compose.mounts.yml
+
+# Actual env file (copy .env.example → .env and fill in values locally).
+docker/env/.env
+
+# Top-level config files.
+# Keep examples in git, ignore local real config copies.
+configs/*.yaml
+!configs/*.example.yaml
+# Bundle directories.
+# shared.example/ - template bundle tracked in git; NOT loaded at runtime.
+# personal/ and any user-created bundles (e.g. team-a/) are gitignored.
+configs/bundles/personal/*
+!configs/bundles/personal/.gitkeep
+configs/bundles/*/
+!configs/bundles/shared.example/
+!configs/bundles/personal/
+
+# ── Model artefacts ──────────────────────────────────────────────────────────
+# GGUF files are large binary blobs; place them at docker/models/ before building
+# model scratch images with make model-images-build.
+docker/models/*.gguf
+
+# ── Certificates ─────────────────────────────────────────────────────────────
+# Place your corp CA cert here for offline builds: docker/certs/corp-ca.crt
+# The file is git-ignored to avoid committing internal PKI material.
+docker/certs/*.crt
+docker/certs/*.pem
+docker/certs/*.cer
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+
+# ── OS / editor ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.exe
+
+
+# IDE discovery links recreated by ai-copilots/BOOTSTRAP.md
+.cursor/skills/
+.cursor/agents/
+.github/skills/
+.github/agents/
+ignore.*
